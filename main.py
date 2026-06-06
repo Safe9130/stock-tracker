@@ -10,13 +10,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-DB_PATH = Path("data/watchlist.db")
+import os
+DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/watchlist.db"))
 CACHE: dict = {}
 CACHE_TTL = 300  # 5 minutes
 
 
 def init_db():
-    DB_PATH.parent.mkdir(exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS stocks (
