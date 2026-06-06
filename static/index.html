@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>股票前瞻本益比追蹤</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --card2: #273548;
+    --border: #334155;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --green: #22c55e;
+    --red: #ef4444;
+    --yellow: #eab308;
+    --blue: #3b82f6;
+    --accent: #6366f1;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
+  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 14px 16px; display: flex; align-items: center; gap: 10px; position: sticky; top: 0; z-index: 10; }
+  header h1 { font-size: 17px; font-weight: 700; flex: 1; }
+  header span { font-size: 22px; }
+  .refresh-btn { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+  .refresh-btn:active { opacity: 0.8; }
+
+  .add-bar { padding: 12px 16px; display: flex; gap: 8px; }
+  .add-bar input { flex: 1; background: var(--card); border: 1px solid var(--border); color: var(--text); border-radius: 10px; padding: 10px 14px; font-size: 15px; outline: none; }
+  .add-bar input::placeholder { color: var(--muted); }
+  .add-bar input:focus { border-color: var(--accent); }
+  .add-bar button { background: var(--accent); color: #fff; border: none; border-radius: 10px; padding: 10px 18px; font-size: 15px; cursor: pointer; white-space: nowrap; }
+
+  .list { padding: 0 12px 100px; display: flex; flex-direction: column; gap: 10px; }
+
+  .card { background: var(--card); border-radius: 14px; padding: 14px 16px; border: 1px solid var(--border); position: relative; }
+  .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }
+  .card-symbol { font-size: 18px; font-weight: 700; }
+  .card-name { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .card-price { text-align: right; }
+  .card-price .price { font-size: 20px; font-weight: 700; }
+  .card-price .currency { font-size: 11px; color: var(--muted); }
+
+  .metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 6px; }
+  .metric { background: var(--card2); border-radius: 10px; padding: 8px 10px; }
+  .metric-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
+  .metric-value { font-size: 15px; font-weight: 600; }
+  .metric-value.good { color: var(--green); }
+  .metric-value.warn { color: var(--yellow); }
+  .metric-value.bad { color: var(--red); }
+  .metric-value.na { color: var(--muted); font-size: 13px; }
+
+  .pe-badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; margin-top: 8px; }
+  .pe-low { background: rgba(34,197,94,0.15); color: var(--green); }
+  .pe-mid { background: rgba(234,179,8,0.15); color: var(--yellow); }
+  .pe-high { background: rgba(239,68,68,0.15); color: var(--red); }
+  .pe-na { background: rgba(148,163,184,0.1); color: var(--muted); }
+
+  .card-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+  .eps-edit { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .eps-edit input { width: 80px; background: var(--card2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 4px 8px; font-size: 12px; outline: none; }
+  .eps-edit button { background: var(--border); border: none; color: var(--text); border-radius: 6px; padding: 4px 8px; font-size: 11px; cursor: pointer; }
+  .del-btn { background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; padding: 0 4px; line-height: 1; }
+  .del-btn:active { color: var(--red); }
+
+  .upside { font-size: 12px; }
+  .upside.pos { color: var(--green); }
+  .upside.neg { color: var(--red); }
+
+  .empty { text-align: center; color: var(--muted); padding: 60px 20px; font-size: 15px; }
+  .loading { text-align: center; color: var(--muted); padding: 40px; }
+
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--card2); border: 1px solid var(--border); color: var(--text); padding: 10px 20px; border-radius: 20px; font-size: 13px; z-index: 99; opacity: 0; transition: opacity 0.3s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+
+  .error-card { background: rgba(239,68,68,0.1); border-color: rgba(239,68,68,0.3); }
+  .error-msg { color: var(--red); font-size: 13px; }
+
+  .last-updated { text-align: center; font-size: 11px; color: var(--muted); padding: 6px; }
+</style>
+</head>
+<body>
+
+<header>
+  <span>📈</span>
+  <h1>前瞻本益比追蹤</h1>
+  <button class="refresh-btn" onclick="loadAll()">重新整理</button>
+</header>
+
+<div class="add-bar">
+  <input id="symbolInput" placeholder="輸入代碼（如 TSMC：2330.TW，台積電ADR：TSM）" onkeydown="if(event.key==='Enter')addStock()">
+  <button onclick="addStock()">新增</button>
+</div>
+
+<div id="lastUpdated" class="last-updated"></div>
+<div id="list" class="list"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '';
+
+function showToast(msg, duration = 2500) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), duration);
+}
+
+function peBadge(pe) {
+  if (pe == null) return '<span class="pe-badge pe-na">本益比 N/A</span>';
+  if (pe < 15) return `<span class="pe-badge pe-low">前瞻本益比 ${pe}x ✓ 偏低</span>`;
+  if (pe < 25) return `<span class="pe-badge pe-mid">前瞻本益比 ${pe}x 合理</span>`;
+  return `<span class="pe-badge pe-high">前瞻本益比 ${pe}x 偏高</span>`;
+}
+
+function peClass(pe) {
+  if (pe == null) return 'na';
+  if (pe < 15) return 'good';
+  if (pe < 25) return 'warn';
+  return 'bad';
+}
+
+function fmt(v, decimals = 2) {
+  if (v == null) return '<span class="na">-</span>';
+  return Number(v).toFixed(decimals);
+}
+
+function renderCard(s) {
+  if (s.error) {
+    return `
+      <div class="card error-card" data-symbol="${s.symbol}">
+        <div class="card-header">
+          <div><div class="card-symbol">${s.symbol}</div></div>
+          <button class="del-btn" onclick="removeStock('${s.symbol}')">✕</button>
+        </div>
+        <div class="error-msg">載入失敗：${s.error}</div>
+      </div>`;
+  }
+
+  const sym = s.symbol;
+  const name = s.display_name || s.name || sym;
+  const price = s.price != null ? Number(s.price).toLocaleString('zh-TW', {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '-';
+  const cur = s.currency || '';
+  const fpe = s.forward_pe;
+  const tpe = s.trailing_pe;
+  const feps = s.forward_eps;
+  const target = s.target_price;
+  const upside = s.upside_pct;
+
+  let upsideHtml = '';
+  if (upside != null) {
+    const cls = upside >= 0 ? 'pos' : 'neg';
+    const sign = upside >= 0 ? '+' : '';
+    upsideHtml = `<span class="upside ${cls}">目標價 ${target != null ? Number(target).toFixed(1) : '-'} (${sign}${upside}%)</span>`;
+  }
+
+  const hi = s.fifty_two_week_high;
+  const lo = s.fifty_two_week_low;
+  let rangeHtml = '-';
+  if (hi && lo) rangeHtml = `${Number(lo).toFixed(0)} – ${Number(hi).toFixed(0)}`;
+
+  return `
+    <div class="card" data-symbol="${sym}">
+      <div class="card-header">
+        <div>
+          <div class="card-symbol">${sym}</div>
+          <div class="card-name">${name}${s.sector ? ' · ' + s.sector : ''}</div>
+        </div>
+        <div class="card-price">
+          <div class="price">${price}</div>
+          <div class="currency">${cur}</div>
+        </div>
+      </div>
+
+      <div class="metrics">
+        <div class="metric">
+          <div class="metric-label">前瞻本益比</div>
+          <div class="metric-value ${peClass(fpe)}">${fpe != null ? fpe + 'x' : '-'}</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">前瞻 EPS</div>
+          <div class="metric-value">${feps != null ? Number(feps).toFixed(2) : '-'}</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">歷史本益比</div>
+          <div class="metric-value na">${tpe != null ? tpe + 'x' : '-'}</div>
+        </div>
+      </div>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px;margin-top:8px;">
+        ${peBadge(fpe)}
+        ${upsideHtml}
+      </div>
+
+      <div class="card-footer">
+        <div class="eps-edit">
+          <span>手動 EPS：</span>
+          <input id="eps_${sym}" type="number" step="0.01" placeholder="${feps != null ? feps : '輸入'}" value="${s._manual_eps != null ? s._manual_eps : ''}">
+          <button onclick="saveEps('${sym}')">套用</button>
+        </div>
+        <button class="del-btn" onclick="removeStock('${sym}')">✕</button>
+      </div>
+    </div>`;
+}
+
+async function loadAll() {
+  const listEl = document.getElementById('list');
+  listEl.innerHTML = '<div class="loading">載入中…</div>';
+  try {
+    const res = await fetch(`${API}/api/watchlist/data`);
+    const stocks = await res.json();
+    if (stocks.length === 0) {
+      listEl.innerHTML = '<div class="empty">尚無追蹤股票<br>輸入代碼後按新增</div>';
+    } else {
+      listEl.innerHTML = stocks.map(renderCard).join('');
+    }
+    const now = new Date();
+    document.getElementById('lastUpdated').textContent = `更新於 ${now.toLocaleTimeString('zh-TW')}（資料延遲約 15 分鐘）`;
+  } catch (e) {
+    listEl.innerHTML = `<div class="empty">載入失敗：${e.message}</div>`;
+  }
+}
+
+async function addStock() {
+  const input = document.getElementById('symbolInput');
+  const symbol = input.value.trim().toUpperCase();
+  if (!symbol) return;
+
+  showToast('新增中…');
+  try {
+    const res = await fetch(`${API}/api/watchlist`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || '新增失敗');
+    input.value = '';
+    showToast(`✓ ${symbol} 已新增`);
+    loadAll();
+  } catch (e) {
+    showToast(`❌ ${e.message}`);
+  }
+}
+
+async function removeStock(symbol) {
+  await fetch(`${API}/api/watchlist/${symbol}`, {method: 'DELETE'});
+  showToast(`${symbol} 已移除`);
+  loadAll();
+}
+
+async function saveEps(symbol) {
+  const val = document.getElementById(`eps_${symbol}`).value;
+  const eps = val === '' ? null : parseFloat(val);
+  try {
+    await fetch(`${API}/api/watchlist/${symbol}/eps`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({manual_eps: eps})
+    });
+    showToast(`✓ ${symbol} EPS 已更新`);
+    loadAll();
+  } catch (e) {
+    showToast('更新失敗');
+  }
+}
+
+loadAll();
+setInterval(loadAll, 5 * 60 * 1000);
+</script>
+</body>
+</html>
