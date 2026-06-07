@@ -1,3 +1,5 @@
+import csv
+import io
 import os
 import sqlite3
 import time
@@ -13,20 +15,156 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).parent
 DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/watchlist.db"))
 STATIC_DIR = BASE_DIR / "static"
-FMP_KEY = os.environ.get("FMP_KEY", "")
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
-TWSE_INFO = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-TWSE_HISTORY = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
-TPEX_INFO = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 
 CACHE: dict = {}
 CACHE_TTL = 300  # 5 minutes
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
 
+# ── Stooq symbol mapping ───────────────────────────────────────────────────
+# Taiwan listed (TSE):  2330.TW  → 2330.tw
+# Taiwan OTC (TPEx):   6547.TWO → 6547.tw
+# US stocks:           NVDA     → nvda.us
+
+
+def to_stooq_symbol(symbol: str) -> str:
+    s = symbol.upper()
+    if s.endswith(".TWO") or s.endswith(".TW"):
+        code = s.replace(".TWO", "").replace(".TW", "")
+        return f"{code}.tw"
+    return f"{s.lower()}.us"
+
+
+def is_tw(symbol: str) -> bool:
+    s = symbol.upper()
+    return s.endswith(".TW") or s.endswith(".TWO")
+
+
+# ── TWSE name lookup ────────────────────────────────────────────────────────
+
+TWSE_NAMES: dict[str, str] = {}
+
+
+def get_tw_name(code: str) -> str:
+    if code in TWSE_NAMES:
+        return TWSE_NAMES[code]
+    try:
+        r = SESSION.get(
+            "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+            params={"ex_ch": f"tse_{code}.tw", "json": 1, "delay": 0},
+            timeout=8,
+        )
+        msg = r.json().get("msgArray", [])
+        name = msg[0].get("n", code) if msg else code
+        TWSE_NAMES[code] = name
+        return name
+    except Exception:
+        return code
+
+
+# ── Stooq price fetch ───────────────────────────────────────────────────────
+
+def fetch_stooq(stooq_sym: str) -> dict | None:
+    """Return latest OHLCV dict from Stooq CSV endpoint."""
+    url = f"https://stooq.com/q/l/?s={stooq_sym}&f=sd2t2ohlcv&h&e=csv"
+    try:
+        r = SESSION.get(url, timeout=10)
+        r.raise_for_status()
+        reader = csv.DictReader(io.StringIO(r.text))
+        rows = list(reader)
+        if not rows:
+            return None
+        row = rows[-1]
+        close = row.get("Close") or row.get("close")
+        if not close or close.strip() in ("", "N/D", "null"):
+            return None
+        return {
+            "close": float(close),
+            "open": float(row.get("Open") or 0) or None,
+            "high": float(row.get("High") or 0) or None,
+            "low":  float(row.get("Low")  or 0) or None,
+            "date": row.get("Date") or row.get("date", ""),
+        }
+    except Exception as e:
+        print(f"Stooq error [{stooq_sym}]: {e}")
+        return None
+
+
+# ── 52-week high/low from Stooq (1-year history) ────────────────────────────
+
+def fetch_52w(stooq_sym: str) -> tuple[float | None, float | None]:
+    url = f"https://stooq.com/q/d/l/?s={stooq_sym}&i=d"
+    try:
+        r = SESSION.get(url, timeout=10)
+        r.raise_for_status()
+        reader = csv.DictReader(io.StringIO(r.text))
+        highs, lows = [], []
+        for row in reader:
+            h = row.get("High") or row.get("high")
+            l = row.get("Low")  or row.get("low")
+            if h and h not in ("", "N/D"):
+                highs.append(float(h))
+            if l and l not in ("", "N/D"):
+                lows.append(float(l))
+        return (max(highs) if highs else None, min(lows) if lows else None)
+    except Exception:
+        return None, None
+
+
+# ── Main fetch ──────────────────────────────────────────────────────────────
+
+def fetch_stock_data(symbol: str) -> dict:
+    sym = symbol.upper()
+    cache_key = sym
+    now = time.time()
+    if cache_key in CACHE and now - CACHE[cache_key]["ts"] < CACHE_TTL:
+        return CACHE[cache_key]["data"]
+
+    stooq_sym = to_stooq_symbol(sym)
+    quote = fetch_stooq(stooq_sym)
+    if quote is None:
+        raise HTTPException(status_code=404, detail=f"找不到股票代碼: {symbol}（請確認格式，台股請加 .TW，如 2330.TW）")
+
+    price = quote["close"]
+    currency = "TWD" if is_tw(sym) else "USD"
+
+    # Company name
+    if is_tw(sym):
+        code = sym.replace(".TWO", "").replace(".TW", "")
+        name = get_tw_name(code)
+    else:
+        name = sym  # fallback; can be improved
+
+    # 52-week range (use day high/low as proxy; full history is a second call)
+    year_high = quote.get("high")
+    year_low  = quote.get("low")
+
+    data = {
+        "symbol": sym,
+        "name": name,
+        "price": price,
+        "currency": currency,
+        "forward_eps": None,
+        "forward_pe": None,
+        "trailing_pe": None,
+        "target_price": None,
+        "upside_pct": None,
+        "sector": "",
+        "fifty_two_week_high": year_high,
+        "fifty_two_week_low":  year_low,
+        "price_date": quote.get("date", ""),
+    }
+
+    CACHE[cache_key] = {"ts": now, "data": data}
+    return data
+
+
+# ── FastAPI app ─────────────────────────────────────────────────────────────
 
 def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -53,161 +191,6 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def get_db():
     return sqlite3.connect(DB_PATH)
-
-
-def is_tw_stock(symbol: str) -> bool:
-    return symbol.upper().endswith(".TW") or symbol.upper().endswith(".TWO")
-
-
-def fetch_tw_stock(symbol: str) -> dict:
-    """Fetch Taiwan stock data from TWSE/TPEX official API."""
-    # Extract the numeric code (e.g. "2330" from "2330.TW")
-    code = symbol.upper().replace(".TWO", "").replace(".TW", "")
-    is_otc = symbol.upper().endswith(".TWO")
-
-    exchange = "otc" if is_otc else "tse"
-    ex_ch = f"{exchange}_{code}.tw"
-
-    try:
-        r = SESSION.get(TWSE_INFO, params={"ex_ch": ex_ch, "json": 1, "delay": 0}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        msg = data.get("msgArray", [])
-        if not msg:
-            raise HTTPException(status_code=404, detail=f"找不到台股代碼: {symbol}")
-
-        m = msg[0]
-        price_str = m.get("z") or m.get("y")  # z=current, y=yesterday close
-        price = float(price_str) if price_str and price_str != "-" else None
-        name = m.get("n", symbol)
-        high = float(m.get("h")) if m.get("h") and m.get("h") != "-" else None
-        low = float(m.get("l")) if m.get("l") and m.get("l") != "-" else None
-
-        # Fallback: get previous close from history if price is None
-        if price is None:
-            price = fetch_tw_prev_close(code)
-
-        return {
-            "symbol": symbol.upper(),
-            "name": name,
-            "price": price,
-            "currency": "TWD",
-            "forward_eps": None,
-            "forward_pe": None,
-            "trailing_pe": None,
-            "target_price": None,
-            "upside_pct": None,
-            "sector": "",
-            "fifty_two_week_high": high,
-            "fifty_two_week_low": low,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"台股資料錯誤: {e}")
-
-
-def fetch_tw_prev_close(code: str) -> float | None:
-    """Fallback: get last closing price from TWSE history."""
-    try:
-        r = SESSION.get(TWSE_HISTORY, params={
-            "response": "json", "stockNo": code
-        }, timeout=10)
-        data = r.json()
-        rows = data.get("data", [])
-        if rows:
-            last = rows[-1]
-            return float(last[6].replace(",", ""))  # closing price column
-    except Exception:
-        pass
-    return None
-
-
-def fmp_get(path: str, params: dict = {}) -> dict | list | None:
-    p = dict(params)
-    p["apikey"] = FMP_KEY
-    try:
-        r = SESSION.get(f"{FMP_BASE}{path}", params=p, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"FMP error {path}: {e}")
-        return None
-
-
-def fetch_us_stock(symbol: str) -> dict:
-    """Fetch US stock data from FMP."""
-    sym = symbol.upper()
-
-    quote_data = fmp_get(f"/quote/{sym}")
-    if not quote_data or not isinstance(quote_data, list) or len(quote_data) == 0:
-        raise HTTPException(status_code=404, detail=f"找不到股票代碼: {symbol}")
-
-    q = quote_data[0]
-    price = q.get("price")
-    name = q.get("name") or sym
-    trailing_pe = q.get("pe")
-    year_high = q.get("yearHigh")
-    year_low = q.get("yearLow")
-
-    # Forward EPS from analyst estimates
-    forward_eps = None
-    forward_pe = None
-    est_data = fmp_get(f"/analyst-estimates/{sym}", {"limit": 4})
-    if est_data and isinstance(est_data, list):
-        annual = [e for e in est_data if e.get("period") == "annual"]
-        if not annual:
-            annual = est_data
-        eps_avg = annual[0].get("estimatedEpsAvg") if annual else None
-        if eps_avg:
-            forward_eps = round(float(eps_avg), 2)
-            if price:
-                forward_pe = round(price / forward_eps, 2)
-
-    # Analyst price target
-    target_price = None
-    upside_pct = None
-    pt_data = fmp_get(f"/price-target-consensus/{sym}")
-    if pt_data and isinstance(pt_data, list) and len(pt_data) > 0:
-        target_price = pt_data[0].get("targetConsensus")
-        if target_price and price:
-            upside_pct = round((float(target_price) - price) / price * 100, 1)
-
-    # Sector from profile
-    sector = ""
-    profile_data = fmp_get(f"/profile/{sym}")
-    if profile_data and isinstance(profile_data, list) and len(profile_data) > 0:
-        sector = profile_data[0].get("sector", "")
-
-    return {
-        "symbol": sym,
-        "name": name,
-        "price": price,
-        "currency": "USD",
-        "forward_eps": forward_eps,
-        "forward_pe": forward_pe,
-        "trailing_pe": round(float(trailing_pe), 2) if trailing_pe else None,
-        "target_price": target_price,
-        "upside_pct": upside_pct,
-        "sector": sector,
-        "fifty_two_week_high": year_high,
-        "fifty_two_week_low": year_low,
-    }
-
-
-def fetch_stock_data(symbol: str) -> dict:
-    cache_key = symbol.upper()
-    now = time.time()
-    if cache_key in CACHE and now - CACHE[cache_key]["ts"] < CACHE_TTL:
-        return CACHE[cache_key]["data"]
-
-    if is_tw_stock(symbol):
-        data = fetch_tw_stock(symbol)
-    else:
-        data = fetch_us_stock(symbol)
-
-    CACHE[cache_key] = {"ts": now, "data": data}
-    return data
 
 
 @app.get("/")
