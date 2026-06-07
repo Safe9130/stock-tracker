@@ -1,4 +1,4 @@
-import json
+import os
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -10,8 +10,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-import os
+BASE_DIR = Path(__file__).parent
 DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/watchlist.db"))
+STATIC_DIR = BASE_DIR / "static"
 CACHE: dict = {}
 CACHE_TTL = 300  # 5 minutes
 
@@ -36,7 +37,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Stock Tracker", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 def get_db():
@@ -96,7 +97,7 @@ def fetch_stock_data(symbol: str) -> dict:
 
 @app.get("/")
 def root():
-    return FileResponse("static/index.html")
+    return FileResponse(str(STATIC_DIR / "index.html"))
 
 
 @app.get("/api/stock/{symbol}")
