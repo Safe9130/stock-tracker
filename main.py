@@ -4,7 +4,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import yfinance as yf
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,8 +13,14 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).parent
 DB_PATH = Path(os.environ.get("DB_PATH", "/tmp/watchlist.db"))
 STATIC_DIR = BASE_DIR / "static"
+FMP_KEY = os.environ.get("FMP_KEY", "")
+FMP_BASE = "https://financialmodelingprep.com/api/v3"
+
 CACHE: dict = {}
 CACHE_TTL = 300  # 5 minutes
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "stock-tracker/1.0"})
 
 
 def init_db():
@@ -44,51 +50,81 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 
+def fmp_get(path: str, params: dict = {}) -> dict | list | None:
+    params["apikey"] = FMP_KEY
+    try:
+        r = SESSION.get(f"{FMP_BASE}{path}", params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"FMP error {path}: {e}")
+        return None
+
+
 def fetch_stock_data(symbol: str) -> dict:
     cache_key = symbol.upper()
     now = time.time()
     if cache_key in CACHE and now - CACHE[cache_key]["ts"] < CACHE_TTL:
         return CACHE[cache_key]["data"]
 
-    ticker = yf.Ticker(symbol)
-    info = ticker.info
+    sym = symbol.upper()
 
-    price = (
-        info.get("currentPrice")
-        or info.get("regularMarketPrice")
-        or info.get("previousClose")
-    )
-    forward_eps = info.get("forwardEps")
-    forward_pe = info.get("forwardPE")
-    trailing_pe = info.get("trailingPE")
-    target_price = info.get("targetMeanPrice")
-    currency = info.get("currency", "USD")
-    name = info.get("shortName") or info.get("longName") or symbol
-    sector = info.get("sector", "")
-    fifty_two_week_high = info.get("fiftyTwoWeekHigh")
-    fifty_two_week_low = info.get("fiftyTwoWeekLow")
+    # 1. Quote — price, trailing PE, name
+    quote_data = fmp_get(f"/quote/{sym}")
+    if not quote_data or not isinstance(quote_data, list) or len(quote_data) == 0:
+        raise HTTPException(status_code=404, detail=f"找不到股票代碼: {symbol}")
 
-    # Calculate forward PE from manual EPS if missing
-    if price and forward_eps and not forward_pe:
-        forward_pe = round(price / forward_eps, 2)
+    q = quote_data[0]
+    price = q.get("price")
+    name = q.get("name") or sym
+    trailing_pe = q.get("pe")
+    currency = "TWD" if sym.endswith(".TW") else "USD"
+    year_high = q.get("yearHigh")
+    year_low = q.get("yearLow")
 
-    upside = None
-    if price and target_price:
-        upside = round((target_price - price) / price * 100, 1)
+    # 2. Analyst estimates — forward EPS
+    forward_eps = None
+    forward_pe = None
+    target_price = None
+    upside_pct = None
+
+    est_data = fmp_get(f"/analyst-estimates/{sym}", {"limit": 2})
+    if est_data and isinstance(est_data, list) and len(est_data) > 0:
+        # Find the most recent annual estimate (period = "annual" or closest future)
+        annual = [e for e in est_data if e.get("period", "") == "annual" or "-12" in e.get("date", "")]
+        target = annual[0] if annual else est_data[0]
+        eps_avg = target.get("estimatedEpsAvg")
+        if eps_avg:
+            forward_eps = round(float(eps_avg), 2)
+            if price:
+                forward_pe = round(price / forward_eps, 2)
+
+    # 3. Price target
+    pt_data = fmp_get(f"/price-target-consensus/{sym}")
+    if pt_data and isinstance(pt_data, list) and len(pt_data) > 0:
+        target_price = pt_data[0].get("targetConsensus")
+        if target_price and price:
+            upside_pct = round((float(target_price) - price) / price * 100, 1)
+
+    # 4. Profile — sector
+    sector = ""
+    profile_data = fmp_get(f"/profile/{sym}")
+    if profile_data and isinstance(profile_data, list) and len(profile_data) > 0:
+        sector = profile_data[0].get("sector", "")
 
     data = {
-        "symbol": symbol.upper(),
+        "symbol": sym,
         "name": name,
         "price": price,
         "currency": currency,
         "forward_eps": forward_eps,
-        "forward_pe": round(forward_pe, 2) if forward_pe else None,
-        "trailing_pe": round(trailing_pe, 2) if trailing_pe else None,
+        "forward_pe": forward_pe,
+        "trailing_pe": round(float(trailing_pe), 2) if trailing_pe else None,
         "target_price": target_price,
-        "upside_pct": upside,
+        "upside_pct": upside_pct,
         "sector": sector,
-        "fifty_two_week_high": fifty_two_week_high,
-        "fifty_two_week_low": fifty_two_week_low,
+        "fifty_two_week_high": year_high,
+        "fifty_two_week_low": year_low,
     }
 
     CACHE[cache_key] = {"ts": now, "data": data}
@@ -104,8 +140,6 @@ def root():
 def get_stock(symbol: str):
     try:
         data = fetch_stock_data(symbol.upper())
-        if data["price"] is None:
-            raise HTTPException(status_code=404, detail=f"找不到股票代碼: {symbol}")
         return data
     except HTTPException:
         raise
@@ -135,11 +169,8 @@ def get_watchlist():
 @app.post("/api/watchlist")
 def add_to_watchlist(req: AddStockRequest):
     symbol = req.symbol.upper()
-    # Validate the symbol exists
     try:
         data = fetch_stock_data(symbol)
-        if data["price"] is None:
-            raise HTTPException(status_code=404, detail=f"找不到股票代碼: {symbol}")
     except HTTPException:
         raise
     except Exception as e:
@@ -168,7 +199,6 @@ def update_manual_eps(symbol: str, req: UpdateEpsRequest):
             "UPDATE stocks SET manual_eps = ? WHERE symbol = ?",
             (req.manual_eps, symbol.upper()),
         )
-    # Invalidate cache so forward PE recalculates
     CACHE.pop(symbol.upper(), None)
     return {"ok": True}
 
@@ -184,16 +214,12 @@ def get_watchlist_with_data():
     for symbol, display_name, manual_eps in rows:
         try:
             data = fetch_stock_data(symbol)
-            # Override EPS with manual value if set
             if manual_eps is not None:
                 data["forward_eps"] = manual_eps
                 price = data.get("price")
                 if price:
                     data["forward_pe"] = round(price / manual_eps, 2)
-            if display_name:
-                data["display_name"] = display_name
-            else:
-                data["display_name"] = data.get("name", symbol)
+            data["display_name"] = display_name or data.get("name", symbol)
             results.append(data)
         except Exception as e:
             results.append({"symbol": symbol, "error": str(e)})
